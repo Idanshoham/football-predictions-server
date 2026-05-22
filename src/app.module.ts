@@ -7,6 +7,13 @@ import { HealthController } from './health/health.controller';
 import { MatchesModule } from './matches/matches.module';
 import { PredictionsModule } from './predictions/predictions.module';
 import { IntegrationsModule } from './integrations/integrations.module';
+import { LeaderboardModule } from './leaderboard/leaderboard.module';
+import { TournamentModule } from './tournament/tournament.module';
+import { ScoringModule } from './scoring/scoring.module';
+import { JobsModule } from './jobs/jobs.module';
+import { InternalModule } from './internal/internal.module';
+import { PlayersModule } from './players/players.module';
+import { TeamsModule } from './teams/teams.module';
 
 @Module({
   imports: [
@@ -17,6 +24,13 @@ import { IntegrationsModule } from './integrations/integrations.module';
     MatchesModule,
     PredictionsModule,
     IntegrationsModule,
+    LeaderboardModule,
+    TournamentModule,
+    ScoringModule,
+    JobsModule,
+    InternalModule,
+    PlayersModule,
+    TeamsModule,
   ],
   controllers: [HealthController],
 })

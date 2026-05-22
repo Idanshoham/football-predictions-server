@@ -111,6 +111,7 @@ model Match {
   status              MatchStatus @default(scheduled)
   stage               MatchStage
   groupName           String?     @map("group_name") // for group-stage matches
+  slotId              String?     @map("slot_id")    // for knockout matches: "r32_1".."third"
   homeScore           Int?        @map("home_score")
   awayScore           Int?        @map("away_score")
   firstScorerPlayerId String?     @map("first_scorer_player_id")
