@@ -1,0 +1,218 @@
+// Football Predictions — Prisma schema
+// Multi-tournament ready: every domain entity has tournament_id.
+// V1 implementation targets World Cup 2026, but Euro 2028 etc. can coexist.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Tournament {
+  id              String   @id @default(cuid())
+  slug            String   @unique // "wc2026", "euro2028"
+  nameHe          String   @map("name_he")
+  nameEn          String   @map("name_en")
+  openerKickoffAt DateTime @map("opener_kickoff_at") @db.Timestamptz(3)
+  isActive        Boolean  @default(true) @map("is_active")
+
+  teams                  Team[]
+  players                Player[]
+  matches                Match[]
+  tournamentPredictions  TournamentPrediction[]
+  groupPredictions       GroupPrediction[]
+  bracketPredictions     BracketPrediction[]
+
+  @@map("tournaments")
+}
+
+model User {
+  id              String   @id @default(cuid())
+  supabaseUserId  String   @unique @map("supabase_user_id")
+  email           String   @unique
+  name            String
+  avatarUrl       String?  @map("avatar_url")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  signupLockedAt  DateTime? @map("signup_locked_at") @db.Timestamptz(3)
+
+  predictions            Prediction[]
+  tournamentPredictions  TournamentPrediction[]
+  groupPredictions       GroupPrediction[]
+  bracketPredictions     BracketPrediction[]
+  emailNotifications     EmailNotification[]
+
+  @@map("users")
+}
+
+model Team {
+  id           String   @id @default(cuid())
+  tournamentId String   @map("tournament_id")
+  nameHe       String   @map("name_he")
+  nameEn       String   @map("name_en")
+  groupName    String?  @map("group_name") // "A", "B", ... null for non-group-stage teams
+  apiIds       Json     @map("api_ids") // { footballDataOrg: 123, theSportsDb: "456" }
+  flagEmoji    String?  @map("flag_emoji")
+
+  tournament   Tournament @relation(fields: [tournamentId], references: [id])
+  players      Player[]
+  homeMatches  Match[]    @relation("HomeMatches")
+  awayMatches  Match[]    @relation("AwayMatches")
+
+  @@index([tournamentId])
+  @@map("teams")
+}
+
+model Player {
+  id           String  @id @default(cuid())
+  teamId       String  @map("team_id")
+  tournamentId String  @map("tournament_id")
+  nameHe       String  @map("name_he")
+  nameEn       String  @map("name_en")
+  position     String? // "GK" | "DF" | "MF" | "FW"
+  apiIds       Json    @map("api_ids")
+  isActive     Boolean @default(true) @map("is_active")
+
+  team       Team       @relation(fields: [teamId], references: [id])
+  tournament Tournament @relation(fields: [tournamentId], references: [id])
+
+  @@index([teamId])
+  @@index([tournamentId])
+  @@map("players")
+}
+
+enum MatchStatus {
+  scheduled
+  live
+  halftime
+  full_time
+  postponed
+  cancelled
+}
+
+enum MatchStage {
+  group
+  r32
+  r16
+  qf
+  sf
+  final
+  third
+}
+
+model Match {
+  id                  String      @id @default(cuid())
+  tournamentId        String      @map("tournament_id")
+  homeTeamId          String      @map("home_team_id")
+  awayTeamId          String      @map("away_team_id")
+  kickoffAt           DateTime    @map("kickoff_at") @db.Timestamptz(3)
+  status              MatchStatus @default(scheduled)
+  stage               MatchStage
+  groupName           String?     @map("group_name") // for group-stage matches
+  homeScore           Int?        @map("home_score")
+  awayScore           Int?        @map("away_score")
+  firstScorerPlayerId String?     @map("first_scorer_player_id")
+  apiIds              Json        @map("api_ids")
+  finishedAt          DateTime?   @map("finished_at") @db.Timestamptz(3)
+
+  tournament  Tournament   @relation(fields: [tournamentId], references: [id])
+  homeTeam    Team         @relation("HomeMatches", fields: [homeTeamId], references: [id])
+  awayTeam    Team         @relation("AwayMatches", fields: [awayTeamId], references: [id])
+  predictions Prediction[]
+
+  @@index([tournamentId])
+  @@index([kickoffAt])
+  @@index([status])
+  @@map("matches")
+}
+
+model Prediction {
+  id                       String   @id @default(cuid())
+  userId                   String   @map("user_id")
+  matchId                  String   @map("match_id")
+  homeScorePred            Int      @map("home_score_pred")
+  awayScorePred            Int      @map("away_score_pred")
+  firstScorerPlayerId      String?  @map("first_scorer_player_id")
+  pointsTotal              Int      @default(0) @map("points_total")
+  createdAt                DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user  User  @relation(fields: [userId], references: [id])
+  match Match @relation(fields: [matchId], references: [id])
+
+  @@unique([userId, matchId])
+  @@index([matchId])
+  @@map("predictions")
+}
+
+model TournamentPrediction {
+  id                  String  @id @default(cuid())
+  userId              String  @map("user_id")
+  tournamentId        String  @map("tournament_id")
+  championTeamId      String? @map("champion_team_id")
+  goldenBootPlayerId  String? @map("golden_boot_player_id")
+  pointsTotal         Int     @default(0) @map("points_total")
+
+  user       User       @relation(fields: [userId], references: [id])
+  tournament Tournament @relation(fields: [tournamentId], references: [id])
+
+  @@unique([userId, tournamentId])
+  @@map("tournament_predictions")
+}
+
+model GroupPrediction {
+  id           String @id @default(cuid())
+  userId       String @map("user_id")
+  tournamentId String @map("tournament_id")
+  groupName    String @map("group_name") // "A".."L"
+  ranking      Json   // ["teamId1", "teamId2", "teamId3", "teamId4"]
+  points       Int    @default(0)
+
+  user       User       @relation(fields: [userId], references: [id])
+  tournament Tournament @relation(fields: [tournamentId], references: [id])
+
+  @@unique([userId, tournamentId, groupName])
+  @@map("group_predictions")
+}
+
+model BracketPrediction {
+  id            String @id @default(cuid())
+  userId        String @map("user_id")
+  tournamentId  String @map("tournament_id")
+  version       Int    // 1 = initial; 2 = post-group-stage edit
+  matchSlot     String @map("match_slot") // "r32_1".."r32_16","r16_1".."r16_8","qf_1".."qf_4","sf_1","sf_2","final","third"
+  winnerTeamId  String @map("winner_team_id")
+  points        Int    @default(0)
+
+  user       User       @relation(fields: [userId], references: [id])
+  tournament Tournament @relation(fields: [tournamentId], references: [id])
+
+  @@unique([userId, tournamentId, version, matchSlot])
+  @@map("bracket_predictions")
+}
+
+model EmailNotification {
+  id       String   @id @default(cuid())
+  userId   String   @map("user_id")
+  matchId  String   @map("match_id")
+  type     String // "pre_match_2h" | "first_scorer_dropped" | etc.
+  sentAt   DateTime @default(now()) @map("sent_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([userId, matchId, type])
+  @@map("email_notifications")
+}
+
+model DataAudit {
+  id          String   @id @default(cuid())
+  ts          DateTime @default(now()) @db.Timestamptz(3)
+  event       String   // "fetch_success" | "fetch_failure" | "fallback_used" | "score_changed" | "rescore_triggered"
+  payloadJson Json     @map("payload_json")
+
+  @@index([ts])
+  @@index([event])
+  @@map("data_audit")
+}
