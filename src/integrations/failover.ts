@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { PrismaService } from '../prisma/prisma.service';
+import { AuditRepository } from '../audit/audit.repository';
 import { FootballDataOrgProvider } from './football-data-org.provider';
 import { TheSportsDbProvider } from './the-sports-db.provider';
 import type { FootballDataProvider, MatchSnapshot } from './provider.interface';
@@ -31,7 +31,7 @@ export class ProviderFailover {
   private readonly providers: FootballDataProvider[];
 
   constructor(
-    private readonly prisma: PrismaService,
+    private readonly audit: AuditRepository,
     primary: FootballDataOrgProvider,
     secondary: TheSportsDbProvider,
   ) {
@@ -66,7 +66,7 @@ export class ProviderFailover {
             `[${op}] primary failed; using fallback "${provider.name}"`,
           );
         }
-        await this.audit(fallbackUsed ? 'fallback_used' : 'fetch_success', {
+        await this.audit.record(fallbackUsed ? 'fallback_used' : 'fetch_success', {
           op,
           provider: provider.name,
           previousErrors: errors,
@@ -79,24 +79,8 @@ export class ProviderFailover {
       }
     }
 
-    await this.audit('fetch_failure', { op, errors });
+    await this.audit.record('fetch_failure', { op, errors });
     return { ok: false, errors };
-  }
-
-  private async audit(
-    event: 'fetch_success' | 'fetch_failure' | 'fallback_used',
-    payload: unknown,
-  ): Promise<void> {
-    try {
-      await this.prisma.dataAudit.create({
-        data: { event, payloadJson: payload as object },
-      });
-    } catch (e) {
-      // Audit write failure should never propagate.
-      this.logger.error(
-        `failed to write data_audit row: ${e instanceof Error ? e.message : e}`,
-      );
-    }
   }
 }
 

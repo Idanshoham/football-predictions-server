@@ -1,21 +1,19 @@
 import {
   CanActivate,
   ExecutionContext,
-  ForbiddenException,
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as jwt from 'jsonwebtoken';
-import { PrismaService } from '../prisma/prisma.service';
-import { isKickoffPassed } from '../lib/time';
+import { UsersService } from '../users/users.service';
 import type { Request } from 'express';
 import type { SupabaseJwtPayload } from './types';
 
 @Injectable()
 export class SupabaseAuthGuard implements CanActivate {
   constructor(
-    private readonly prisma: PrismaService,
+    private readonly users: UsersService,
     private readonly config: ConfigService,
   ) {}
 
@@ -39,7 +37,6 @@ export class SupabaseAuthGuard implements CanActivate {
       throw new UnauthorizedException('Invalid or expired token');
     }
 
-    const supabaseUserId = payload.sub;
     const email = payload.email ?? '';
     const name =
       payload.user_metadata?.full_name ??
@@ -51,28 +48,12 @@ export class SupabaseAuthGuard implements CanActivate {
       payload.user_metadata?.picture ??
       null;
 
-    let user = await this.prisma.user.findUnique({
-      where: { supabaseUserId },
+    const user = await this.users.findOrCreate({
+      supabaseUserId: payload.sub,
+      email,
+      name,
+      avatarUrl,
     });
-
-    if (!user) {
-      // Sign-up lock: after opener kickoff, no new users.
-      const activeTournament = await this.prisma.tournament.findFirst({
-        where: { isActive: true },
-        orderBy: { openerKickoffAt: 'asc' },
-      });
-      if (activeTournament && isKickoffPassed(activeTournament.openerKickoffAt)) {
-        throw new ForbiddenException(
-          'Sign-up has closed (tournament already started)',
-        );
-      }
-      if (!email) {
-        throw new UnauthorizedException('Token is missing an email claim');
-      }
-      user = await this.prisma.user.create({
-        data: { supabaseUserId, email, name, avatarUrl },
-      });
-    }
 
     req.user = user;
     return true;

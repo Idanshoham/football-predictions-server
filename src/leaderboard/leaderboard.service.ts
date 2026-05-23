@@ -1,5 +1,9 @@
 import { Injectable } from '@nestjs/common';
-import { PrismaService } from '../prisma/prisma.service';
+import { UsersRepository } from '../users/users.repository';
+import { PredictionsRepository } from '../predictions/predictions.repository';
+import { TournamentPredictionsRepository } from '../tournament/tournament-predictions.repository';
+import { GroupPredictionsRepository } from '../tournament/group-predictions.repository';
+import { BracketPredictionsRepository } from '../tournament/bracket-predictions.repository';
 
 export interface LeaderboardRow {
   rank: number;
@@ -14,48 +18,34 @@ export interface LeaderboardRow {
 
 @Injectable()
 export class LeaderboardService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly users: UsersRepository,
+    private readonly predictions: PredictionsRepository,
+    private readonly tournamentPredictions: TournamentPredictionsRepository,
+    private readonly groupPredictions: GroupPredictionsRepository,
+    private readonly bracketPredictions: BracketPredictionsRepository,
+  ) {}
 
   /**
    * Returns the leaderboard sorted by total points DESC, then exact-prediction
-   * count DESC, then correct-result count DESC. Ties get the same rank.
+   * count DESC, then correct-result count DESC. Ties broken alphabetically.
    *
-   * 5 batched queries regardless of user count.
+   * Five batched queries regardless of user count.
    */
   async list(tournamentId?: string): Promise<LeaderboardRow[]> {
-    const [users, predictions, tournamentPreds, groupPreds, bracketPreds] =
-      await Promise.all([
-        this.prisma.user.findMany({
-          select: { id: true, name: true, avatarUrl: true },
-        }),
-        this.prisma.prediction.findMany({
-          select: {
-            userId: true,
-            homeScorePred: true,
-            awayScorePred: true,
-            pointsTotal: true,
-            match: {
-              select: {
-                status: true,
-                homeScore: true,
-                awayScore: true,
-              },
-            },
-          },
-        }),
-        this.prisma.tournamentPrediction.findMany({
-          where: tournamentId ? { tournamentId } : undefined,
-          select: { userId: true, pointsTotal: true },
-        }),
-        this.prisma.groupPrediction.findMany({
-          where: tournamentId ? { tournamentId } : undefined,
-          select: { userId: true, points: true },
-        }),
-        this.prisma.bracketPrediction.findMany({
-          where: tournamentId ? { tournamentId } : undefined,
-          select: { userId: true, points: true },
-        }),
-      ]);
+    const [
+      users,
+      predictions,
+      tournamentPreds,
+      groupPreds,
+      bracketPreds,
+    ] = await Promise.all([
+      this.users.listAllForLeaderboard(),
+      this.predictions.listAllWithMatchOutcomes(),
+      this.tournamentPredictions.listAllForLeaderboard(tournamentId),
+      this.groupPredictions.listAllByTournament(tournamentId),
+      this.bracketPredictions.listAllByTournament(tournamentId),
+    ]);
 
     const matchPoints = sumBy(predictions, (p) => p.userId, (p) => p.pointsTotal);
     const tournamentPoints = sumBy(tournamentPreds, (p) => p.userId, (p) => p.pointsTotal);

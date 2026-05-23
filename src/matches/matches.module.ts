@@ -1,10 +1,11 @@
 import { Module } from '@nestjs/common';
 import { MatchesController } from './matches.controller';
 import { MatchesService } from './matches.service';
+import { MatchesRepository } from './matches.repository';
 
 @Module({
   controllers: [MatchesController],
-  providers: [MatchesService],
-  exports: [MatchesService],
+  providers: [MatchesService, MatchesRepository],
+  exports: [MatchesService, MatchesRepository],
 })
 export class MatchesModule {}

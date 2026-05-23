@@ -5,7 +5,9 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { MatchStatus, Prediction, User } from '@prisma/client';
-import { PrismaService } from '../prisma/prisma.service';
+import { PredictionsRepository } from './predictions.repository';
+import { MatchesRepository } from '../matches/matches.repository';
+import { PlayersRepository } from '../players/players.repository';
 import { isKickoffPassed } from '../lib/time';
 import { UpsertPredictionDto } from './dto/upsert-prediction.dto';
 
@@ -20,7 +22,11 @@ export interface RevealedPrediction {
 
 @Injectable()
 export class PredictionsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly predictions: PredictionsRepository,
+    private readonly matches: MatchesRepository,
+    private readonly players: PlayersRepository,
+  ) {}
 
   /**
    * Upsert a per-match prediction.
@@ -34,9 +40,7 @@ export class PredictionsService {
    *     home or away team roster.
    */
   async upsert(user: User, dto: UpsertPredictionDto): Promise<Prediction> {
-    const match = await this.prisma.match.findUnique({
-      where: { id: dto.matchId },
-    });
+    const match = await this.matches.findById(dto.matchId);
     if (!match) throw new NotFoundException(`Match ${dto.matchId} not found`);
 
     if (match.status !== MatchStatus.scheduled) {
@@ -49,13 +53,11 @@ export class PredictionsService {
     }
 
     if (dto.firstScorerPlayerId !== undefined && dto.firstScorerPlayerId !== null) {
-      const player = await this.prisma.player.findFirst({
-        where: {
-          id: dto.firstScorerPlayerId,
-          teamId: { in: [match.homeTeamId, match.awayTeamId] },
-        },
-        select: { id: true },
-      });
+      const player = await this.players.findOnMatchRoster(
+        dto.firstScorerPlayerId,
+        match.homeTeamId,
+        match.awayTeamId,
+      );
       if (!player) {
         throw new BadRequestException(
           'First-scorer player is not on either team in this match',
@@ -63,68 +65,44 @@ export class PredictionsService {
       }
     }
 
-    return this.prisma.prediction.upsert({
-      where: {
-        userId_matchId: { userId: user.id, matchId: dto.matchId },
-      },
-      create: {
-        userId: user.id,
-        matchId: dto.matchId,
-        homeScorePred: dto.homeScorePred,
-        awayScorePred: dto.awayScorePred,
-        firstScorerPlayerId: dto.firstScorerPlayerId ?? null,
-        pointsTotal: 0,
-      },
-      update: {
-        homeScorePred: dto.homeScorePred,
-        awayScorePred: dto.awayScorePred,
-        firstScorerPlayerId: dto.firstScorerPlayerId ?? null,
-      },
+    return this.predictions.upsert({
+      userId: user.id,
+      matchId: dto.matchId,
+      homeScorePred: dto.homeScorePred,
+      awayScorePred: dto.awayScorePred,
+      firstScorerPlayerId: dto.firstScorerPlayerId ?? null,
     });
   }
 
-  async listMine(user: User) {
-    return this.prisma.prediction.findMany({
-      where: { userId: user.id },
-      orderBy: { updatedAt: 'desc' },
-    });
+  listMine(user: User) {
+    return this.predictions.findMine(user.id);
   }
 
-  async getMineForMatch(user: User, matchId: string) {
-    return this.prisma.prediction.findUnique({
-      where: { userId_matchId: { userId: user.id, matchId } },
-    });
+  getMineForMatch(user: User, matchId: string) {
+    return this.predictions.findMineForMatch(user.id, matchId);
   }
 
   /**
    * Visibility rule (strict):
    * - User always sees their own prediction (returned as `mine`).
    * - Other users' predictions are returned ONLY if the match has reached
-   *   kickoff (status = live/halftime/full_time/postponed/cancelled, or scheduled
-   *   but `kickoffAt` already passed — a transient state right at kickoff).
-   *   Otherwise `others` is an empty array.
+   *   kickoff (status non-scheduled OR `kickoffAt` already passed — the
+   *   transient state right at kickoff). Otherwise `others` is empty.
    */
   async getForMatch(
     user: User,
     matchId: string,
   ): Promise<{ mine: Prediction | null; others: RevealedPrediction[] }> {
-    const match = await this.prisma.match.findUnique({ where: { id: matchId } });
+    const match = await this.matches.findById(matchId);
     if (!match) throw new NotFoundException(`Match ${matchId} not found`);
 
-    const mine = await this.getMineForMatch(user, matchId);
+    const mine = await this.predictions.findMineForMatch(user.id, matchId);
 
     const revealed =
       match.status !== MatchStatus.scheduled || isKickoffPassed(match.kickoffAt);
+    if (!revealed) return { mine, others: [] };
 
-    if (!revealed) {
-      return { mine, others: [] };
-    }
-
-    const all = await this.prisma.prediction.findMany({
-      where: { matchId, NOT: { userId: user.id } },
-      include: { user: { select: { id: true, name: true } } },
-    });
-
+    const all = await this.predictions.findOthersForMatch(user.id, matchId);
     return {
       mine,
       others: all.map((p) => ({

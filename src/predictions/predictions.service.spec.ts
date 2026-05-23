@@ -1,18 +1,28 @@
-import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { MatchStatus } from '@prisma/client';
 import { PredictionsService } from './predictions.service';
-import type { PrismaService } from '../prisma/prisma.service';
+import type { PredictionsRepository } from './predictions.repository';
+import type { MatchesRepository } from '../matches/matches.repository';
+import type { PlayersRepository } from '../players/players.repository';
 
-// Hand-rolled PrismaService mock — narrow surface area, no jest.mock magic.
-function makePrismaMock(): jest.Mocked<Pick<PrismaService, 'match' | 'player' | 'prediction'>> {
+function makeMocks() {
   return {
-    match: { findUnique: jest.fn() } as never,
-    player: { findFirst: jest.fn() } as never,
-    prediction: {
+    predictions: {
       upsert: jest.fn(),
-      findMany: jest.fn(),
-      findUnique: jest.fn(),
-    } as never,
+      findMine: jest.fn(),
+      findMineForMatch: jest.fn(),
+      findOthersForMatch: jest.fn(),
+    } as unknown as jest.Mocked<PredictionsRepository>,
+    matches: {
+      findById: jest.fn(),
+    } as unknown as jest.Mocked<MatchesRepository>,
+    players: {
+      findOnMatchRoster: jest.fn(),
+    } as unknown as jest.Mocked<PlayersRepository>,
   };
 }
 
@@ -33,7 +43,7 @@ function makeMatch(overrides: Partial<{ kickoffAt: Date; status: MatchStatus }> 
     id: 'match-1',
     homeTeamId: 'home',
     awayTeamId: 'away',
-    kickoffAt: new Date(Date.now() + 60 * 60 * 1000), // 1h in future
+    kickoffAt: new Date(Date.now() + 60 * 60 * 1000),
     status: MatchStatus.scheduled,
     ...overrides,
   };
@@ -41,9 +51,9 @@ function makeMatch(overrides: Partial<{ kickoffAt: Date; status: MatchStatus }> 
 
 describe('PredictionsService.upsert', () => {
   it('rejects when match is not found', async () => {
-    const prisma = makePrismaMock();
-    (prisma.match.findUnique as jest.Mock).mockResolvedValue(null);
-    const service = new PredictionsService(prisma as unknown as PrismaService);
+    const mocks = makeMocks();
+    mocks.matches.findById.mockResolvedValue(null);
+    const service = new PredictionsService(mocks.predictions, mocks.matches, mocks.players);
 
     await expect(
       service.upsert(makeUser(), {
@@ -55,11 +65,9 @@ describe('PredictionsService.upsert', () => {
   });
 
   it('rejects when match status is live', async () => {
-    const prisma = makePrismaMock();
-    (prisma.match.findUnique as jest.Mock).mockResolvedValue(
-      makeMatch({ status: MatchStatus.live }),
-    );
-    const service = new PredictionsService(prisma as unknown as PrismaService);
+    const mocks = makeMocks();
+    mocks.matches.findById.mockResolvedValue(makeMatch({ status: MatchStatus.live }) as never);
+    const service = new PredictionsService(mocks.predictions, mocks.matches, mocks.players);
 
     await expect(
       service.upsert(makeUser(), {
@@ -71,11 +79,11 @@ describe('PredictionsService.upsert', () => {
   });
 
   it('rejects when kickoff has already passed (strict, no grace)', async () => {
-    const prisma = makePrismaMock();
-    (prisma.match.findUnique as jest.Mock).mockResolvedValue(
-      makeMatch({ kickoffAt: new Date(Date.now() - 1) }),
+    const mocks = makeMocks();
+    mocks.matches.findById.mockResolvedValue(
+      makeMatch({ kickoffAt: new Date(Date.now() - 1) }) as never,
     );
-    const service = new PredictionsService(prisma as unknown as PrismaService);
+    const service = new PredictionsService(mocks.predictions, mocks.matches, mocks.players);
 
     await expect(
       service.upsert(makeUser(), {
@@ -87,10 +95,10 @@ describe('PredictionsService.upsert', () => {
   });
 
   it('rejects when first-scorer is not on either team', async () => {
-    const prisma = makePrismaMock();
-    (prisma.match.findUnique as jest.Mock).mockResolvedValue(makeMatch());
-    (prisma.player.findFirst as jest.Mock).mockResolvedValue(null);
-    const service = new PredictionsService(prisma as unknown as PrismaService);
+    const mocks = makeMocks();
+    mocks.matches.findById.mockResolvedValue(makeMatch() as never);
+    mocks.players.findOnMatchRoster.mockResolvedValue(null);
+    const service = new PredictionsService(mocks.predictions, mocks.matches, mocks.players);
 
     await expect(
       service.upsert(makeUser(), {
@@ -103,10 +111,10 @@ describe('PredictionsService.upsert', () => {
   });
 
   it('accepts a valid prediction without first-scorer', async () => {
-    const prisma = makePrismaMock();
-    (prisma.match.findUnique as jest.Mock).mockResolvedValue(makeMatch());
-    (prisma.prediction.upsert as jest.Mock).mockResolvedValue({ id: 'pred-1' });
-    const service = new PredictionsService(prisma as unknown as PrismaService);
+    const mocks = makeMocks();
+    mocks.matches.findById.mockResolvedValue(makeMatch() as never);
+    mocks.predictions.upsert.mockResolvedValue({ id: 'pred-1' } as never);
+    const service = new PredictionsService(mocks.predictions, mocks.matches, mocks.players);
 
     const result = await service.upsert(makeUser(), {
       matchId: 'match-1',
@@ -114,21 +122,21 @@ describe('PredictionsService.upsert', () => {
       awayScorePred: 1,
     });
     expect(result).toEqual({ id: 'pred-1' });
-    expect(prisma.prediction.upsert).toHaveBeenCalled();
+    expect(mocks.predictions.upsert).toHaveBeenCalled();
   });
 
-  it('accepts a valid prediction with first-scorer that is on a team', async () => {
-    const prisma = makePrismaMock();
-    (prisma.match.findUnique as jest.Mock).mockResolvedValue(makeMatch());
-    (prisma.player.findFirst as jest.Mock).mockResolvedValue({ id: 'player-on-home' });
-    (prisma.prediction.upsert as jest.Mock).mockResolvedValue({ id: 'pred-1' });
-    const service = new PredictionsService(prisma as unknown as PrismaService);
+  it('accepts a valid prediction with first-scorer on a team', async () => {
+    const mocks = makeMocks();
+    mocks.matches.findById.mockResolvedValue(makeMatch() as never);
+    mocks.players.findOnMatchRoster.mockResolvedValue({ id: 'p-home' } as never);
+    mocks.predictions.upsert.mockResolvedValue({ id: 'pred-1' } as never);
+    const service = new PredictionsService(mocks.predictions, mocks.matches, mocks.players);
 
     const result = await service.upsert(makeUser(), {
       matchId: 'match-1',
       homeScorePred: 2,
       awayScorePred: 1,
-      firstScorerPlayerId: 'player-on-home',
+      firstScorerPlayerId: 'p-home',
     });
     expect(result).toEqual({ id: 'pred-1' });
   });
@@ -136,24 +144,24 @@ describe('PredictionsService.upsert', () => {
 
 describe('PredictionsService.getForMatch (visibility)', () => {
   it('returns only mine when match is scheduled and kickoff is in the future', async () => {
-    const prisma = makePrismaMock();
-    (prisma.match.findUnique as jest.Mock).mockResolvedValue(makeMatch());
-    (prisma.prediction.findUnique as jest.Mock).mockResolvedValue({ id: 'pred-mine' });
-    const service = new PredictionsService(prisma as unknown as PrismaService);
+    const mocks = makeMocks();
+    mocks.matches.findById.mockResolvedValue(makeMatch() as never);
+    mocks.predictions.findMineForMatch.mockResolvedValue({ id: 'pred-mine' } as never);
+    const service = new PredictionsService(mocks.predictions, mocks.matches, mocks.players);
 
     const result = await service.getForMatch(makeUser(), 'match-1');
     expect(result.mine).toEqual({ id: 'pred-mine' });
     expect(result.others).toEqual([]);
-    expect(prisma.prediction.findMany).not.toHaveBeenCalled();
+    expect(mocks.predictions.findOthersForMatch).not.toHaveBeenCalled();
   });
 
   it('reveals others when match is live', async () => {
-    const prisma = makePrismaMock();
-    (prisma.match.findUnique as jest.Mock).mockResolvedValue(
-      makeMatch({ status: MatchStatus.live }),
+    const mocks = makeMocks();
+    mocks.matches.findById.mockResolvedValue(
+      makeMatch({ status: MatchStatus.live }) as never,
     );
-    (prisma.prediction.findUnique as jest.Mock).mockResolvedValue(null);
-    (prisma.prediction.findMany as jest.Mock).mockResolvedValue([
+    mocks.predictions.findMineForMatch.mockResolvedValue(null);
+    mocks.predictions.findOthersForMatch.mockResolvedValue([
       {
         homeScorePred: 1,
         awayScorePred: 0,
@@ -161,8 +169,8 @@ describe('PredictionsService.getForMatch (visibility)', () => {
         pointsTotal: 0,
         user: { id: 'user-2', name: 'B' },
       },
-    ]);
-    const service = new PredictionsService(prisma as unknown as PrismaService);
+    ] as never);
+    const service = new PredictionsService(mocks.predictions, mocks.matches, mocks.players);
 
     const result = await service.getForMatch(makeUser(), 'match-1');
     expect(result.others.length).toBe(1);
@@ -170,16 +178,16 @@ describe('PredictionsService.getForMatch (visibility)', () => {
   });
 
   it('reveals others when scheduled but kickoff has passed (edge case)', async () => {
-    const prisma = makePrismaMock();
-    (prisma.match.findUnique as jest.Mock).mockResolvedValue(
-      makeMatch({ kickoffAt: new Date(Date.now() - 1) }),
+    const mocks = makeMocks();
+    mocks.matches.findById.mockResolvedValue(
+      makeMatch({ kickoffAt: new Date(Date.now() - 1) }) as never,
     );
-    (prisma.prediction.findUnique as jest.Mock).mockResolvedValue(null);
-    (prisma.prediction.findMany as jest.Mock).mockResolvedValue([]);
-    const service = new PredictionsService(prisma as unknown as PrismaService);
+    mocks.predictions.findMineForMatch.mockResolvedValue(null);
+    mocks.predictions.findOthersForMatch.mockResolvedValue([] as never);
+    const service = new PredictionsService(mocks.predictions, mocks.matches, mocks.players);
 
     const result = await service.getForMatch(makeUser(), 'match-1');
-    expect(prisma.prediction.findMany).toHaveBeenCalled();
+    expect(mocks.predictions.findOthersForMatch).toHaveBeenCalled();
     expect(result.others).toEqual([]);
   });
 });

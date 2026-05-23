@@ -1,7 +1,8 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { Tournament } from '@prisma/client';
-import { PrismaService } from '../prisma/prisma.service';
+import { MatchStage, Tournament } from '@prisma/client';
 import { nowUtc } from '../lib/time';
+import { TournamentRepository } from './tournament.repository';
+import { MatchesRepository } from '../matches/matches.repository';
 
 export type BracketLockState =
   | 'open'                // before opener kickoff — initial edit
@@ -9,35 +10,29 @@ export type BracketLockState =
   | 'edit-window'         // between group end and R32 kickoff — one re-edit
   | 'locked-permanently'; // R32 kicked off
 
-const GROUP_MATCH_DURATION_MS = 2 * 60 * 60 * 1000; // assume each match wraps within 2h of kickoff
+const GROUP_MATCH_DURATION_MS = 2 * 60 * 60 * 1000;
 
 @Injectable()
 export class TournamentService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly tournaments: TournamentRepository,
+    private readonly matches: MatchesRepository,
+  ) {}
 
   async getActive(): Promise<Tournament> {
-    const t = await this.prisma.tournament.findFirst({
-      where: { isActive: true },
-      orderBy: { openerKickoffAt: 'asc' },
-    });
+    const t = await this.tournaments.findActive();
     if (!t) throw new NotFoundException('No active tournament configured');
     return t;
   }
 
-  /**
-   * Returns the global tournament-prediction lock state for the active
-   * tournament. Used by champion / golden boot / group rankings, all of
-   * which lock at opener kickoff.
-   */
   async isLocked(): Promise<boolean> {
     const t = await this.getActive();
     return nowUtc().getTime() >= t.openerKickoffAt.getTime();
   }
 
   /**
-   * Returns the bracket edit-window state machine.
-   * Implements: opener-kickoff → locked → group-stage-ends → edit-window →
-   * R32-kickoff → permanently-locked.
+   * Bracket edit-window state machine: opener-kickoff → locked → end-of-
+   * group-stage → edit-window → R32-kickoff → permanently-locked.
    */
   async getBracketLockState(): Promise<BracketLockState> {
     const t = await this.getActive();
@@ -46,23 +41,15 @@ export class TournamentService {
 
     if (now < openerMs) return 'open';
 
-    // Find the latest group-stage kickoff to estimate "end of group stage".
-    const lastGroupMatch = await this.prisma.match.findFirst({
-      where: { tournamentId: t.id, stage: 'group' },
-      orderBy: { kickoffAt: 'desc' },
-    });
+    const lastGroupMatch = await this.matches.findLatestGroupStageKickoff(t.id);
     const groupEndsMs = lastGroupMatch
       ? lastGroupMatch.kickoffAt.getTime() + GROUP_MATCH_DURATION_MS
-      : openerMs + 18 * 24 * 60 * 60 * 1000; // fallback: opener + 18 days
+      : openerMs + 18 * 24 * 60 * 60 * 1000;
 
     if (now < groupEndsMs) return 'locked-final';
 
-    // Find the first R32 (round-of-32) kickoff.
-    const firstR32 = await this.prisma.match.findFirst({
-      where: { tournamentId: t.id, stage: 'r32' },
-      orderBy: { kickoffAt: 'asc' },
-    });
-    if (!firstR32) return 'edit-window'; // schedule not fully seeded yet
+    const firstR32 = await this.matches.findEarliestKickoffByStage(t.id, MatchStage.r32);
+    if (!firstR32) return 'edit-window';
     if (now < firstR32.kickoffAt.getTime()) return 'edit-window';
 
     return 'locked-permanently';

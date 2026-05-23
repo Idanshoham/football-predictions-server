@@ -9,7 +9,7 @@ The scoring functions are the sacred core of this app — a bug means everyone g
 
 ## When to use
 
-- Adding a new scoring component (e.g. "+2 for predicting both teams to score").
+- Adding a new scoring component.
 - Changing the points value of an existing rule.
 - Changing a tiebreaker.
 - Adding a new tournament-level award.
@@ -18,41 +18,41 @@ The scoring functions are the sacred core of this app — a bug means everyone g
 
 ### 1. Find the right file
 
-| Scope | File |
-|---|---|
-| Per-match prediction (score + first scorer) | `src/scoring/match-scoring.ts` |
-| Champion + Golden Boot | `src/scoring/tournament-scoring.ts` (Champion+GB) |
-| Group rankings | `src/scoring/tournament-scoring.ts` (Group section) |
-| Bracket (per knockout match-winner) | `src/scoring/bracket-scoring.ts` |
-| Aggregate "rescore everything from raw state" | `src/scoring/rescore.service.ts` |
+| Scope | File | Layer |
+|---|---|---|
+| Per-match (score + first scorer) | `src/scoring/match-scoring.ts` | pure |
+| Champion + Golden Boot | `src/scoring/tournament-scoring.ts` | pure |
+| Group rankings (points calc) | `src/scoring/tournament-scoring.ts` | pure |
+| Bracket (per knockout match-winner) | `src/scoring/bracket-scoring.ts` | pure |
+| Aggregate "rescore everything" | `src/scoring/rescore.service.ts` | impure (injects repos) |
 
-If your rule doesn't fit any of these, you're probably introducing a new dimension — discuss the schema implications before writing code.
+The pure scoring files (`match-scoring.ts`, `tournament-scoring.ts`, `bracket-scoring.ts`) are the rules. `RescoreService` is the orchestrator — it injects repositories from other modules and runs the pure rules in a loop.
 
-### 2. Keep scoring functions PURE
+### 2. Keep pure scoring functions PURE
 
-The non-negotiable contract:
+Non-negotiable contract for `match-scoring.ts`, `tournament-scoring.ts`, `bracket-scoring.ts`:
 
-- No DB access. No `PrismaService` injected.
+- No DB access. No `PrismaService` or any repository imported.
 - No I/O. No `fetch`. No `console.log`.
 - No `new Date()`. Time has no meaning to scoring — the input already encodes whether the match is final.
 - No mutation of the input arguments.
 - Deterministic: same inputs always produce the same output.
 
-If you need data the function doesn't currently receive (e.g. number of cards), expand the input type — don't reach into the DB from inside scoring.
+If you need data the function doesn't currently receive, expand the input type — don't reach into the DB from inside scoring.
 
 ### 3. Add the rule
 
-Update the type signature in `src/scoring/types.ts` if the input shape changes. Then implement the rule in the appropriate function. Match the existing style:
+Update the type signature in `src/scoring/types.ts` if the input shape changes. Then implement the rule in the appropriate pure file.
 
+Match the existing style:
 - One function per scoring concept.
 - Return a number, or null for "not finalised yet".
-- Use `Math.sign` for result-direction comparisons, not chains of `>=`/`<`.
-- Constants exported (e.g. `MATCH_POINTS_MAX`) for use by tests and the leaderboard.
+- Use `Math.sign` for result-direction comparisons.
+- Constants exported (e.g. `MATCH_POINTS_MAX`) for tests and the leaderboard.
 
 ### 4. Update the max-points constant
 
-If the rule changes the maximum possible per-unit points, update the corresponding constant:
-
+If the rule changes the maximum possible per-unit points, update:
 - `MATCH_POINTS_MAX` in `match-scoring.ts`
 - `POINTS_CHAMPION`, `POINTS_GOLDEN_BOOT`, `POINTS_PER_GROUP_SLOT` in `tournament-scoring.ts`
 - `POINTS_PER_BRACKET_MATCH`, `BRACKET_MATCH_COUNT`, `BRACKET_MAX_POINTS` in `bracket-scoring.ts`
@@ -61,17 +61,16 @@ The property tests reference these — if you forget, the tests break.
 
 ### 5. Write fixture tests
 
-Add at least:
+At minimum:
+- One test exercising the new rule alone.
+- One test combining it with existing rules.
+- One edge case where the input that triggers the rule is missing/null.
 
-- One test that exercises the new rule alone (everything else wrong).
-- One test that exercises the new rule combined with existing rules (verify additivity / override semantics).
-- One test for the edge case where the input that triggers the rule is missing/null.
+Use the readable `it('1-0 vs 1-2 → 1 (just home goals correct)', …)` style. The description should literally state inputs → expected output.
 
-Match the readable `it('1-0 vs 1-2 → 1 (just home goals correct)', …)` style — the description should literally state inputs → expected output. Future readers will diff your test against the function.
+### 6. Write a property-based invariant
 
-### 6. Write a property-based invariant (when applicable)
-
-`fast-check` is already a dev dep. Use it for invariants that should hold universally:
+`fast-check` is a dev dep:
 
 ```ts
 import fc from 'fast-check';
@@ -89,21 +88,31 @@ it('points are non-negative for any input', () => {
 Invariants worth checking:
 - `result >= 0`
 - `result <= MAX`
-- Specific structural properties: e.g. "exact-score always returns 5 + first-scorer bonus."
-- Symmetry: e.g. "swapping home/away of both prediction and actual yields the same score."
+- Exact-score always returns 5 + first-scorer bonus.
+- Symmetry under home/away swap.
 
-### 7. Check `RescoreService` still works
+### 7. Update `RescoreService` if needed
 
-`RescoreService` is the public face of all scoring. After your change:
+`RescoreService` is the public face of all scoring. It's in `src/scoring/rescore.service.ts` and injects:
 
-- Re-read the relevant `rescore*()` method in `src/scoring/rescore.service.ts`.
-- Confirm it still pipes the input through your changed function correctly.
-- If your new rule reads data the rescore method doesn't fetch, expand the rescore method's `select`.
+- `MatchesRepository`
+- `PredictionsRepository`
+- `TournamentRepository`
+- `TournamentPredictionsRepository`
+- `GroupPredictionsRepository`
+- `BracketPredictionsRepository`
+- `AuditRepository`
+
+After your change:
+- Confirm the relevant `rescore*()` method still pipes the right inputs.
+- If your new rule reads data the rescore method doesn't fetch, add a method to the relevant repository AND update the rescore method to call it.
 - Add a test in `rescore.service.spec.ts` if the rule introduces new aggregation logic.
+
+**Never put Prisma calls in `RescoreService` directly** — always go through a repository method. If a repository method doesn't exist for what you need, add one.
 
 ### 8. Update CLAUDE.md if invariants changed
 
-`CLAUDE.md` has a section listing locked invariants and the max-points table. If you changed any of those, update CLAUDE.md in the same commit.
+`CLAUDE.md` has a section listing locked invariants and (implicitly) the max-points contract. If you changed those, update CLAUDE.md in the same commit.
 
 ### 9. Run tests
 
@@ -111,22 +120,24 @@ Invariants worth checking:
 npm test
 ```
 
-All scoring tests must be green. If a property test fails with a surprising counterexample, the counterexample is real — your rule has a bug or your invariant is wrong.
+All scoring tests must be green. A failing property-based test gives a concrete counter-example — that's a real bug to fix.
 
 ## Pitfalls
 
-- **Treating the partial-score group as additive when it should override-or-skip.** `match-scoring.ts` has the locked rule: exact → 5; otherwise sum (result, diff, home, away). The first-scorer bonus is independently additive. Don't restructure this without an explicit policy change.
+- **Adding Prisma calls to `match-scoring.ts`, `tournament-scoring.ts`, or `bracket-scoring.ts`** — these files MUST stay pure. If you need DB data, expose it via a repository method and pass it into the scoring function from `RescoreService`.
+- **Treating the partial-score group as additive when it should override-or-skip.** Locked rule: exact → 5; otherwise sum (result, diff, home, away). First-scorer bonus is independently additive. Don't restructure without an explicit policy change.
 - **Forgetting `match.status !== 'full_time'` → return null.** Scoring should only emit final numbers for finalised matches.
 - **Using `match.homeScore!` (non-null assertion) without checking.** Always check `homeScore === null` first.
 - **Re-using `MATCH_POINTS_MAX` as a generic ceiling everywhere.** Each scoring scope has its own max constant.
 - **Storing intermediate state on the service.** Scoring is stateless. Class fields = bug.
-- **Mutating the input arguments** — TypeScript permits it but it breaks idempotency assumptions in tests.
+- **Mutating the input arguments** — breaks idempotency assumptions in tests.
 
 ## Examples to copy from
 
-- `src/scoring/match-scoring.ts` — the cleanest example of the "exact-overrides / partials-stack" pattern.
-- `src/scoring/match-scoring.spec.ts` — fixture-test style + a strong set of fast-check invariants.
+- `src/scoring/match-scoring.ts` — cleanest example of exact-overrides / partials-stack.
+- `src/scoring/match-scoring.spec.ts` — fixture style + fast-check invariants.
+- `src/scoring/rescore.service.ts` — orchestrator that pipes repository data through pure scoring.
 
 ## When you finish
 
-Run [[fair-play-review]]. Scoring changes are the highest-stakes diff this repo accepts; a fresh review is non-negotiable before merging.
+Run [[fair-play-review]]. Scoring changes are the highest-stakes diff this repo accepts.

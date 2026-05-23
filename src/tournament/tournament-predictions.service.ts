@@ -5,8 +5,12 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { User } from '@prisma/client';
-import { PrismaService } from '../prisma/prisma.service';
 import { TournamentService } from './tournament.service';
+import { TournamentPredictionsRepository } from './tournament-predictions.repository';
+import { GroupPredictionsRepository } from './group-predictions.repository';
+import { BracketPredictionsRepository } from './bracket-predictions.repository';
+import { TeamsRepository } from '../teams/teams.repository';
+import { PlayersRepository } from '../players/players.repository';
 import { allBracketSlots } from '../scoring/bracket-scoring';
 import {
   UpsertBracketDto,
@@ -19,8 +23,12 @@ const BRACKET_SLOTS = new Set(allBracketSlots());
 @Injectable()
 export class TournamentPredictionsService {
   constructor(
-    private readonly prisma: PrismaService,
     private readonly tournament: TournamentService,
+    private readonly tournamentPredictions: TournamentPredictionsRepository,
+    private readonly groupPredictions: GroupPredictionsRepository,
+    private readonly bracketPredictions: BracketPredictionsRepository,
+    private readonly teams: TeamsRepository,
+    private readonly players: PlayersRepository,
   ) {}
 
   // ---------------- Champion + Golden Boot ----------------
@@ -32,41 +40,25 @@ export class TournamentPredictionsService {
     const t = await this.tournament.getActive();
 
     if (dto.championTeamId) {
-      const team = await this.prisma.team.findFirst({
-        where: { id: dto.championTeamId, tournamentId: t.id },
-        select: { id: true },
-      });
+      const team = await this.teams.findInTournament(dto.championTeamId, t.id);
       if (!team) throw new BadRequestException('Champion team is not in this tournament');
     }
     if (dto.goldenBootPlayerId) {
-      const player = await this.prisma.player.findFirst({
-        where: { id: dto.goldenBootPlayerId, tournamentId: t.id },
-        select: { id: true },
-      });
+      const player = await this.players.findInTournament(dto.goldenBootPlayerId, t.id);
       if (!player) throw new BadRequestException('Golden Boot player is not in this tournament');
     }
 
-    return this.prisma.tournamentPrediction.upsert({
-      where: { userId_tournamentId: { userId: user.id, tournamentId: t.id } },
-      create: {
-        userId: user.id,
-        tournamentId: t.id,
-        championTeamId: dto.championTeamId ?? null,
-        goldenBootPlayerId: dto.goldenBootPlayerId ?? null,
-        pointsTotal: 0,
-      },
-      update: {
-        championTeamId: dto.championTeamId ?? null,
-        goldenBootPlayerId: dto.goldenBootPlayerId ?? null,
-      },
+    return this.tournamentPredictions.upsert({
+      userId: user.id,
+      tournamentId: t.id,
+      championTeamId: dto.championTeamId ?? null,
+      goldenBootPlayerId: dto.goldenBootPlayerId ?? null,
     });
   }
 
   async getMyTournamentPrediction(user: User) {
     const t = await this.tournament.getActive();
-    return this.prisma.tournamentPrediction.findUnique({
-      where: { userId_tournamentId: { userId: user.id, tournamentId: t.id } },
-    });
+    return this.tournamentPredictions.findMine(user.id, t.id);
   }
 
   // ---------------- Group rankings ----------------
@@ -77,12 +69,7 @@ export class TournamentPredictionsService {
     }
     const t = await this.tournament.getActive();
 
-    // Validate teams: every id must belong to this group within this tournament.
-    const teamsInGroup = await this.prisma.team.findMany({
-      where: { tournamentId: t.id, groupName: dto.groupName },
-      select: { id: true },
-    });
-    const valid = new Set(teamsInGroup.map((x) => x.id));
+    const teamsInGroup = await this.teams.listByTournamentAndGroup(t.id, dto.groupName);
     if (teamsInGroup.length === 0) {
       throw new NotFoundException(`Group ${dto.groupName} has no teams`);
     }
@@ -94,39 +81,24 @@ export class TournamentPredictionsService {
     if (new Set(dto.ranking).size !== dto.ranking.length) {
       throw new BadRequestException('Ranking has duplicate teams');
     }
+    const valid = new Set(teamsInGroup.map((x) => x.id));
     for (const id of dto.ranking) {
       if (!valid.has(id)) {
         throw new BadRequestException(`Team ${id} is not in group ${dto.groupName}`);
       }
     }
 
-    return this.prisma.groupPrediction.upsert({
-      where: {
-        userId_tournamentId_groupName: {
-          userId: user.id,
-          tournamentId: t.id,
-          groupName: dto.groupName,
-        },
-      },
-      create: {
-        userId: user.id,
-        tournamentId: t.id,
-        groupName: dto.groupName,
-        ranking: dto.ranking,
-        points: 0,
-      },
-      update: {
-        ranking: dto.ranking,
-      },
+    return this.groupPredictions.upsert({
+      userId: user.id,
+      tournamentId: t.id,
+      groupName: dto.groupName,
+      ranking: dto.ranking,
     });
   }
 
   async getMyGroupRankings(user: User) {
     const t = await this.tournament.getActive();
-    return this.prisma.groupPrediction.findMany({
-      where: { userId: user.id, tournamentId: t.id },
-      orderBy: { groupName: 'asc' },
-    });
+    return this.groupPredictions.findMine(user.id, t.id);
   }
 
   // ---------------- Bracket ----------------
@@ -135,48 +107,29 @@ export class TournamentPredictionsService {
     const version = await this.tournament.getActiveBracketVersion();
     const t = await this.tournament.getActive();
 
-    // Validate slots
     for (const slot of Object.keys(dto.winnersBySlot)) {
       if (!BRACKET_SLOTS.has(slot)) {
         throw new BadRequestException(`Unknown bracket slot: ${slot}`);
       }
     }
-    // Validate teams exist in this tournament
-    const teamIds = new Set(Object.values(dto.winnersBySlot));
-    const teams = await this.prisma.team.findMany({
-      where: { tournamentId: t.id, id: { in: [...teamIds] } },
-      select: { id: true },
-    });
-    const validTeamIds = new Set(teams.map((x) => x.id));
+    const teamIds = [...new Set(Object.values(dto.winnersBySlot))];
+    const existing = await this.teams.listExistingInTournament(t.id, teamIds);
+    const validTeamIds = new Set(existing.map((x) => x.id));
     for (const teamId of teamIds) {
       if (!validTeamIds.has(teamId)) {
         throw new BadRequestException(`Team ${teamId} is not in this tournament`);
       }
     }
 
-    // Upsert each slot individually (small N, simple semantics).
-    const writes = Object.entries(dto.winnersBySlot).map(([matchSlot, winnerTeamId]) =>
-      this.prisma.bracketPrediction.upsert({
-        where: {
-          userId_tournamentId_version_matchSlot: {
-            userId: user.id,
-            tournamentId: t.id,
-            version,
-            matchSlot,
-          },
-        },
-        create: {
-          userId: user.id,
-          tournamentId: t.id,
-          version,
-          matchSlot,
-          winnerTeamId,
-          points: 0,
-        },
-        update: { winnerTeamId },
-      }),
+    await this.bracketPredictions.upsertMany(
+      Object.entries(dto.winnersBySlot).map(([matchSlot, winnerTeamId]) => ({
+        userId: user.id,
+        tournamentId: t.id,
+        version,
+        matchSlot,
+        winnerTeamId,
+      })),
     );
-    await this.prisma.$transaction(writes);
 
     return this.getMyBracket(user);
   }
@@ -187,38 +140,22 @@ export class TournamentPredictionsService {
     const versionToReturn =
       state === 'open' || state === 'locked-final' ? 1 : 2;
 
-    let rows = await this.prisma.bracketPrediction.findMany({
-      where: { userId: user.id, tournamentId: t.id, version: versionToReturn },
-      orderBy: { matchSlot: 'asc' },
-    });
+    let picks = await this.bracketPredictions.findMyVersion(
+      user.id,
+      t.id,
+      versionToReturn,
+    );
 
-    // If we're in the edit window and the user has no v2 picks yet, seed v2 from v1
-    if (state === 'edit-window' && rows.length === 0) {
-      const v1 = await this.prisma.bracketPrediction.findMany({
-        where: { userId: user.id, tournamentId: t.id, version: 1 },
-      });
-      if (v1.length > 0) {
-        const seeded = v1.map((row) => ({
-          ...row,
-          id: undefined as unknown as string,
-          version: 2,
-          points: 0,
-        }));
-        await this.prisma.bracketPrediction.createMany({
-          data: seeded.map(({ id: _ignored, ...rest }) => rest),
-          skipDuplicates: true,
-        });
-        rows = await this.prisma.bracketPrediction.findMany({
-          where: { userId: user.id, tournamentId: t.id, version: 2 },
-          orderBy: { matchSlot: 'asc' },
-        });
-      }
+    // First entry into the edit window: seed v2 from v1 if v2 is empty.
+    if (state === 'edit-window' && picks.length === 0) {
+      await this.bracketPredictions.seedV2FromV1(user.id, t.id);
+      picks = await this.bracketPredictions.findMyVersion(user.id, t.id, 2);
     }
 
     return {
       version: versionToReturn,
       lockState: state,
-      picks: rows,
+      picks,
     };
   }
 }

@@ -1,51 +1,119 @@
 ---
 name: add-endpoint
-description: Add a new HTTP endpoint to the football-predictions-server. Covers controller + service + DTO + validation + auth guard + lock checks. Use whenever extending the API.
+description: Add a new HTTP endpoint to the football-predictions-server. Covers controller + service + repository + DTO + validation + auth guard + lock checks. Use whenever extending the API.
 ---
 
 # add-endpoint
 
-Use this skill whenever you add a new endpoint to the NestJS backend. It exists to prevent the "I forgot the auth guard / lock check / DTO validation" class of bug — every endpoint here either reads from or mutates a privileged resource and a missed guard is a security hole.
+Use this skill whenever you add a new endpoint to the NestJS backend. It exists to prevent the "I forgot the auth guard / lock check / DTO validation" class of bug — and to enforce the controller → service → repository layering everywhere.
 
 ## When to use
 
-- Adding a new route under any module (`matches`, `predictions`, `tournament`, `leaderboard`, `teams`, `players`, `internal`).
-- Adding a brand-new feature module (e.g. `notifications`, `groups`, etc).
-- Refactoring an existing endpoint that's missing a check.
+- Adding a new route under any existing module (`matches`, `predictions`, `tournament`, `leaderboard`, `teams`, `players`, `internal`).
+- Adding a brand-new feature module.
+- Refactoring an existing endpoint that's missing a check or talks to Prisma directly.
+
+## The three layers — never skip one
+
+```
+controller → service → repository → PrismaService
+```
+
+- **Controller**: HTTP only. Routes, guards, `@CurrentUser`, DTO binding. No business logic.
+- **Service**: business rules — lock checks, roster validation, visibility, orchestration across repos.
+- **Repository**: the ONLY layer that touches `PrismaService`. Narrow `select`/`include`. No domain exceptions.
+
+If your new code injects `PrismaService` outside a `*.repository.ts` file, stop and re-route through a repository method.
 
 ## Procedure
 
 ### 1. Pick or create the module
 
-If the endpoint belongs to an existing concept (e.g. another prediction operation), put it in that module. Otherwise create a new module under `src/<name>/` with three files:
+If the endpoint belongs to an existing concept, put it in that module. Otherwise create a new module under `src/<name>/` with **four** files:
 
 ```
 src/<name>/<name>.module.ts
-src/<name>/<name>.service.ts
 src/<name>/<name>.controller.ts
+src/<name>/<name>.service.ts
+src/<name>/<name>.repository.ts
 ```
 
 Add the module to `src/app.module.ts` `imports`. Forgetting this is the most common "endpoint returns 404 even though I wrote it" cause.
 
-### 2. Service first, controller last
+### 2. Repository first
 
-Write the service first because it's pure logic + Prisma. The controller is a thin shell that decorates HTTP semantics on top.
+Write the repository before the service. Keep methods narrow and typed:
 
-Service responsibilities:
-- All Prisma access.
-- All business rules (lock checks, roster validation, visibility).
-- All input validation that can't be expressed declaratively in the DTO.
-- Throws `BadRequestException` / `NotFoundException` / `ForbiddenException` as appropriate.
+```ts
+@Injectable()
+export class FoosRepository {
+  constructor(private readonly prisma: PrismaService) {}
 
-Controller responsibilities:
-- Route mapping (`@Get`, `@Post`, etc).
-- `@UseGuards(SupabaseAuthGuard)` — **mandatory** unless this is an unauthenticated `/health` style endpoint.
-- `@CurrentUser()` to pull the user off the request.
-- DTO binding via `@Body()`.
+  findById(id: string): Promise<Foo | null> {
+    return this.prisma.foo.findUnique({ where: { id } });
+  }
 
-### 3. DTO with class-validator (if accepting input)
+  upsert(data: UpsertFooData): Promise<Foo> {
+    return this.prisma.foo.upsert({ /* ... */ });
+  }
 
-Create `src/<module>/dto/<verb>-<noun>.dto.ts` with `class-validator` decorators. The global `ValidationPipe` (configured in `main.ts`) will enforce them:
+  // Each query gets a named method. Avoid "give me a Prisma client" generics.
+}
+```
+
+Conventions:
+- One method per query shape. Don't expose `findMany({ where, include, select })` raw — wrap it.
+- For cross-method projection: prefer multiple narrow methods (e.g. `findByIdMinimal` vs `findByIdWithRelations`) over a giant options bag.
+- Repos can use transactions internally (`this.prisma.$transaction([…])`). Services shouldn't know about transactions.
+- Never throw NestJS `HttpException` from a repo. Return null / throw a low-level error; the service translates.
+
+### 3. Service next
+
+Write the service second. It's pure logic + repository injections.
+
+```ts
+@Injectable()
+export class FoosService {
+  constructor(
+    private readonly foos: FoosRepository,
+    private readonly matches: MatchesRepository,   // cross-module dep
+    private readonly players: PlayersRepository,   // cross-module dep
+  ) {}
+
+  async upsert(user: User, dto: UpsertFooDto): Promise<Foo> {
+    const match = await this.matches.findById(dto.matchId);
+    if (!match) throw new NotFoundException(/* … */);
+    if (isKickoffPassed(match.kickoffAt)) throw new ForbiddenException(/* … */);
+    // … all the business rules go here …
+    return this.foos.upsert(/* … */);
+  }
+}
+```
+
+Cross-module repo deps require the providing module to export the repo AND the consuming module to import the providing module. See `predictions.module.ts` for the pattern.
+
+### 4. Controller last
+
+Thin shell:
+
+```ts
+@Controller('foos')
+@UseGuards(SupabaseAuthGuard)
+export class FoosController {
+  constructor(private readonly foos: FoosService) {}
+
+  @Post()
+  upsert(@CurrentUser() user: User, @Body() body: UpsertFooDto) {
+    return this.foos.upsert(user, body);
+  }
+}
+```
+
+`@UseGuards(SupabaseAuthGuard)` is **mandatory** at the class level unless this is an unauthenticated `/health` style endpoint.
+
+### 5. DTO with class-validator (if accepting input)
+
+Create `src/<module>/dto/<verb>-<noun>.dto.ts`:
 
 ```ts
 import { IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
@@ -57,81 +125,77 @@ export class FooBarDto {
 }
 ```
 
-The pipe options in `main.ts` are `whitelist: true, forbidNonWhitelisted: true` — unknown fields are rejected. Don't add a fallback "accept anything" pipe.
+The global `ValidationPipe` enforces `whitelist: true, forbidNonWhitelisted: true` — unknown fields are rejected.
 
-### 4. Sacred checks for prediction writes
+### 6. Sacred checks for prediction writes
 
-If the endpoint creates or mutates a prediction (per-match, group, bracket, tournament-level), you MUST include these checks in the service. Use the patterns from `PredictionsService.upsert`:
+If the endpoint creates or mutates a prediction, the service MUST include:
 
 - **Kickoff lock** (per-match writes): `isKickoffPassed(match.kickoffAt)` → throw `ForbiddenException`. Use `src/lib/time.ts` — never inline `new Date()` arithmetic.
 - **Tournament lock** (champion / golden boot / group): `await tournament.isLocked()` → throw `ForbiddenException`.
-- **Bracket state** (bracket writes): `await tournament.getActiveBracketVersion()` — this throws if locked. Use the result as `version` on the upsert.
-- **Roster membership** (first-scorer): query `player` filtered by `id` and `teamId IN (homeTeamId, awayTeamId)`; if not found, throw `BadRequestException`.
-- **Tournament-team membership** (champion, group rankings): query `team` filtered by `tournamentId` and id; if not found, throw `BadRequestException`.
+- **Bracket state** (bracket writes): `await tournament.getActiveBracketVersion()` throws if locked. Use the result as `version` on the upsert.
+- **Roster membership** (first-scorer): `await players.findOnMatchRoster(playerId, homeTeamId, awayTeamId)`; if null, throw `BadRequestException`.
+- **Tournament-team membership** (champion, group rankings): `await teams.findInTournament(teamId, tournamentId)`; if null, throw `BadRequestException`.
 
-### 5. Read endpoints: visibility
+All these checks live in the **service**, not the repository.
 
-For any endpoint that returns predictions, group rankings, or bracket picks for users OTHER than the caller, you must enforce the strict visibility rule:
+### 7. Read endpoints: visibility
 
-- Other users' per-match predictions: only visible when the match is past kickoff (or status is live/halftime/full_time/postponed/cancelled). See `PredictionsService.getForMatch`.
-- Other users' tournament-level / group / bracket predictions: only after the tournament has finished (or after the lock window passed). Default: don't expose them at all.
+For any service method that returns OTHER USERS' predictions, group rankings, or bracket picks, enforce the strict visibility rule (see `PredictionsService.getForMatch`).
 
-Always include only the necessary fields in the response. Never `select: *` other users' rows.
-
-### 6. Wire the module
-
-In `src/app.module.ts`:
+### 8. Wire the module
 
 ```ts
-import { FooModule } from './foo/foo.module';
-
 @Module({
   imports: [
-    // ... existing modules
-    FooModule,
+    MatchesModule,                // because service injects MatchesRepository
+    PlayersModule,                // because service injects PlayersRepository
   ],
+  controllers: [FoosController],
+  providers: [FoosService, FoosRepository],
+  exports: [FoosService, FoosRepository], // export so other modules can inject your repo
 })
+export class FoosModule {}
 ```
 
-If the new module needs `TournamentService`, import `TournamentModule` (which re-exports it). Don't try to inject `TournamentService` without importing the module.
+Then add the new module to `src/app.module.ts` imports.
 
-### 7. Test
+### 9. Test
 
-Write a unit test for the service that mocks `PrismaService` (see `predictions.service.spec.ts` for the hand-rolled mock pattern — no `jest.mock` magic). Cover at minimum:
+Write a unit test for the service that mocks repositories (see `predictions.service.spec.ts` for the hand-rolled mock pattern). Cover at minimum:
 
 - Each reject path (404, 403, 400).
 - The happy path.
-- Visibility: behaviour before vs after kickoff if relevant.
+- Visibility branches if relevant.
 
-Run `npm test` and confirm green before commit.
-
-### 8. Manual smoke test (optional but recommended)
-
-If you have a local Supabase running:
-
-```sh
-TOKEN=<your supabase access token>
-curl -X POST http://localhost:3000/<route> \
-  -H "authorization: bearer $TOKEN" \
-  -H "content-type: application/json" \
-  -d '{"...":"..."}'
+```ts
+const mocks = {
+  foos: { upsert: jest.fn(), findById: jest.fn() } as unknown as jest.Mocked<FoosRepository>,
+  matches: { findById: jest.fn() } as unknown as jest.Mocked<MatchesRepository>,
+};
+const service = new FoosService(mocks.foos, mocks.matches);
 ```
+
+Run `npm test` before commit.
 
 ## Pitfalls
 
-- **Forgetting `@UseGuards(SupabaseAuthGuard)`** → the endpoint is public. Every authenticated controller should have it at the class level. If you need an exception (rare), document it.
-- **Forgetting the lock check on writes** → a user can submit a prediction after kickoff. Strict server-time lock, no grace periods.
-- **Using raw `new Date()` for the lock check** → ESLint will not catch this in the server repo (no rule wired yet). Use `isKickoffPassed`/`nowUtc` from `src/lib/time.ts`.
-- **Skipping the DTO + ValidationPipe** → garbage input reaches the service.
-- **Returning Prisma rows directly with sensitive fields** (e.g. supabaseUserId, email of other users) → use `select` to narrow.
-- **Not invalidating relevant data** in the frontend hook after a mutation → cache stays stale. (Handled in the client repo; mention in PR description if your server change affects what should be invalidated.)
+- **Injecting `PrismaService` in a service** — wrong. Add a repository method instead.
+- **Writing the repository to call services back** — never. Repositories are leaves. Services orchestrate.
+- **Forgetting to export the repository from the module** — other modules can't inject it.
+- **Forgetting `@UseGuards(SupabaseAuthGuard)`** — endpoint is public.
+- **Forgetting the lock check on writes** — strict server-time lock, no grace periods.
+- **Using raw `new Date()` for the lock check** — use `isKickoffPassed`/`nowUtc` from `src/lib/time.ts`.
+- **Returning Prisma rows directly with sensitive fields** (e.g. `supabaseUserId`, other users' email) — use `select` in the repository.
+- **Forgetting `forwardRef` for cyclic module deps** — Teams ↔ Tournament, Players ↔ Tournament use it; new cycles need it too.
 
 ## Examples to copy from
 
-- `src/predictions/predictions.controller.ts` + `predictions.service.ts` — the gold standard write path with lock + roster validation.
-- `src/matches/matches.controller.ts` — clean read endpoint with status filter.
-- `src/leaderboard/leaderboard.service.ts` — batched-query aggregation pattern.
+- `src/predictions/predictions.controller.ts` + `service.ts` + `repository.ts` — the gold standard write path.
+- `src/matches/matches.controller.ts` + `service.ts` + `repository.ts` — clean read pattern.
+- `src/leaderboard/leaderboard.service.ts` — service that injects 5 repositories.
+- `src/tournament/tournament-predictions.service.ts` — service that injects 5+ repositories with rich validation.
 
 ## When you finish
 
-Run [[fair-play-review]] before opening a PR — it catches the kinds of mistakes this skill is designed to prevent.
+Run [[fair-play-review]] before opening a PR.

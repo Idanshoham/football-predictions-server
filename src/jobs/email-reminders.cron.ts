@@ -1,7 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { MatchStatus } from '@prisma/client';
-import { PrismaService } from '../prisma/prisma.service';
+import { TournamentRepository } from '../tournament/tournament.repository';
+import { MatchesRepository } from '../matches/matches.repository';
+import { UsersRepository } from '../users/users.repository';
+import { PredictionsRepository } from '../predictions/predictions.repository';
+import { EmailNotificationsRepository } from '../email/email-notifications.repository';
 import { BrevoService } from '../email/brevo.service';
 import { formatIsraelTime, isWithinReminderWindow } from '../lib/time';
 
@@ -13,7 +16,11 @@ export class EmailRemindersCron {
   private running = false;
 
   constructor(
-    private readonly prisma: PrismaService,
+    private readonly tournaments: TournamentRepository,
+    private readonly matches: MatchesRepository,
+    private readonly users: UsersRepository,
+    private readonly predictions: PredictionsRepository,
+    private readonly notifications: EmailNotificationsRepository,
     private readonly brevo: BrevoService,
   ) {}
 
@@ -37,30 +44,21 @@ export class EmailRemindersCron {
   async runOnce(): Promise<{ sent: number; skipped: number; errors: number }> {
     const result = { sent: 0, skipped: 0, errors: 0 };
 
-    // Candidate matches: scheduled, kickoff in 100-140 minute window.
-    const candidates = await this.prisma.match.findMany({
-      where: { status: MatchStatus.scheduled },
-      include: {
-        homeTeam: true,
-        awayTeam: true,
-      },
-    });
+    const tournament = await this.tournaments.findActive();
+    if (!tournament) return result;
+
+    const candidates = await this.matches.listScheduled(tournament.id);
     const due = candidates.filter((m) => isWithinReminderWindow(m.kickoffAt));
     if (due.length === 0) return result;
 
-    const users = await this.prisma.user.findMany({
-      select: { id: true, email: true, name: true },
-    });
+    const users = await this.users.listAllForReminders();
 
     for (const match of due) {
-      const existingPredictions = await this.prisma.prediction.findMany({
-        where: { matchId: match.id },
-        select: { userId: true },
-      });
-      const haveSent = await this.prisma.emailNotification.findMany({
-        where: { matchId: match.id, type: NOTIFICATION_TYPE },
-        select: { userId: true },
-      });
+      const existingPredictions = await this.predictions.listMissingPredictions(match.id);
+      const haveSent = await this.notifications.listRecipientsForMatch(
+        match.id,
+        NOTIFICATION_TYPE,
+      );
       const predicted = new Set(existingPredictions.map((p) => p.userId));
       const alreadyNotified = new Set(haveSent.map((p) => p.userId));
 
@@ -69,7 +67,7 @@ export class EmailRemindersCron {
       );
 
       for (const user of targets) {
-        const kickoff = formatIsraelTime(match.kickoffAt, "HH:mm");
+        const kickoff = formatIsraelTime(match.kickoffAt, 'HH:mm');
         const date = formatIsraelTime(match.kickoffAt, 'dd/MM');
         const subject = `${match.homeTeam.nameHe} מול ${match.awayTeam.nameHe} בעוד שעתיים`;
         const text = `שלום ${user.name},\n\nהמשחק ${match.homeTeam.nameHe} - ${match.awayTeam.nameHe} מתחיל היום (${date}) בשעה ${kickoff} (שעון ישראל).\n\nעוד לא שלחת תחזית.\n\nלהגיש תחזית: ${this.publicAppUrl()}\n\nבהצלחה,\nמונדיאל 2026`;
@@ -81,17 +79,7 @@ export class EmailRemindersCron {
         });
 
         if (sent.ok) {
-          await this.prisma.emailNotification
-            .create({
-              data: {
-                userId: user.id,
-                matchId: match.id,
-                type: NOTIFICATION_TYPE,
-              },
-            })
-            .catch(() => {
-              // Unique constraint may race; safe to ignore.
-            });
+          await this.notifications.record(user.id, match.id, NOTIFICATION_TYPE);
           result.sent++;
         } else {
           result.errors++;

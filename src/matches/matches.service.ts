@@ -1,52 +1,28 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { MatchStatus } from '@prisma/client';
-import { PrismaService } from '../prisma/prisma.service';
+import { MatchesRepository } from './matches.repository';
 
 export type MatchFilter = 'upcoming' | 'live' | 'past';
 
+const STATUS_BY_FILTER: Record<MatchFilter, MatchStatus[]> = {
+  upcoming: [MatchStatus.scheduled],
+  live: [MatchStatus.live, MatchStatus.halftime],
+  past: [MatchStatus.full_time, MatchStatus.cancelled, MatchStatus.postponed],
+};
+
 @Injectable()
 export class MatchesService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(private readonly matches: MatchesRepository) {}
 
   async list(filter?: MatchFilter) {
-    const where = filterToWhere(filter);
-    return this.prisma.match.findMany({
-      where,
-      include: {
-        homeTeam: true,
-        awayTeam: true,
-      },
-      orderBy: { kickoffAt: 'asc' },
+    return this.matches.list({
+      status: filter ? STATUS_BY_FILTER[filter] : undefined,
     });
   }
 
   async getById(id: string) {
-    const match = await this.prisma.match.findUnique({
-      where: { id },
-      include: {
-        homeTeam: { include: { players: true } },
-        awayTeam: { include: { players: true } },
-      },
-    });
+    const match = await this.matches.findByIdWithFullRosters(id);
     if (!match) throw new NotFoundException(`Match ${id} not found`);
     return match;
   }
-}
-
-function filterToWhere(filter?: MatchFilter) {
-  if (!filter) return {};
-  if (filter === 'upcoming') {
-    return { status: { in: [MatchStatus.scheduled] } };
-  }
-  if (filter === 'live') {
-    return { status: { in: [MatchStatus.live, MatchStatus.halftime] } };
-  }
-  if (filter === 'past') {
-    return {
-      status: {
-        in: [MatchStatus.full_time, MatchStatus.cancelled, MatchStatus.postponed],
-      },
-    };
-  }
-  return {};
 }

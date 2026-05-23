@@ -1,7 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { MatchStatus } from '@prisma/client';
-import { PrismaService } from '../prisma/prisma.service';
+import { TournamentRepository } from '../tournament/tournament.repository';
+import { MatchesRepository } from '../matches/matches.repository';
+import { AuditRepository } from '../audit/audit.repository';
 import { ProviderFailover } from '../integrations/failover';
 import { RescoreService } from '../scoring/rescore.service';
 import { isInLiveWindow } from '../lib/time';
@@ -12,13 +14,15 @@ export class LiveSyncCron {
   private running = false;
 
   constructor(
-    private readonly prisma: PrismaService,
+    private readonly tournaments: TournamentRepository,
+    private readonly matches: MatchesRepository,
+    private readonly audit: AuditRepository,
     private readonly failover: ProviderFailover,
     private readonly rescore: RescoreService,
   ) {}
 
-  // Runs every 30 seconds. The job itself decides whether to call out to
-  // providers based on whether any match is in its live window.
+  // Runs every 30 seconds. The job itself decides whether to call providers
+  // based on whether any match is in its live window.
   @Cron(CronExpression.EVERY_30_SECONDS)
   async tick(): Promise<void> {
     if (this.running) {
@@ -38,27 +42,10 @@ export class LiveSyncCron {
   }
 
   private async runOnce(): Promise<void> {
-    const tournament = await this.prisma.tournament.findFirst({
-      where: { isActive: true },
-    });
+    const tournament = await this.tournaments.findActive();
     if (!tournament) return;
 
-    // Cheap pre-check: is anything actually live?
-    const candidates = await this.prisma.match.findMany({
-      where: {
-        tournamentId: tournament.id,
-        status: { in: [MatchStatus.scheduled, MatchStatus.live, MatchStatus.halftime] },
-      },
-      select: {
-        id: true,
-        status: true,
-        kickoffAt: true,
-        homeScore: true,
-        awayScore: true,
-        firstScorerPlayerId: true,
-        apiIds: true,
-      },
-    });
+    const candidates = await this.matches.listLiveCandidates(tournament.id);
     const liveOrAboutToStart = candidates.filter((m) => isInLiveWindow(m.kickoffAt));
     if (liveOrAboutToStart.length === 0) return;
 
@@ -81,40 +68,23 @@ export class LiveSyncCron {
       const snap = byApiId.get(providerMatchId);
       if (!snap) continue;
 
-      // Only update if something changed.
       const sameScore = m.homeScore === snap.homeScore && m.awayScore === snap.awayScore;
       const sameStatus = m.status === snap.status;
       const sameScorer = m.firstScorerPlayerId === snap.firstScorerPlayerApiId;
       if (sameScore && sameStatus && sameScorer) continue;
 
-      await this.prisma.match.update({
-        where: { id: m.id },
-        data: {
-          homeScore: snap.homeScore,
-          awayScore: snap.awayScore,
-          status: snap.status,
-          firstScorerPlayerId: snap.firstScorerPlayerApiId ?? m.firstScorerPlayerId,
-          finishedAt: snap.status === MatchStatus.full_time ? new Date() : null,
-        },
+      await this.matches.update(m.id, {
+        homeScore: snap.homeScore,
+        awayScore: snap.awayScore,
+        status: snap.status,
+        firstScorerPlayerId: snap.firstScorerPlayerApiId ?? m.firstScorerPlayerId,
+        finishedAt: snap.status === MatchStatus.full_time ? new Date() : null,
       });
-      await this.prisma.dataAudit.create({
-        data: {
-          event: 'score_changed',
-          payloadJson: {
-            matchId: m.id,
-            from: {
-              status: m.status,
-              homeScore: m.homeScore,
-              awayScore: m.awayScore,
-            },
-            to: {
-              status: snap.status,
-              homeScore: snap.homeScore,
-              awayScore: snap.awayScore,
-            },
-            provider: result.providerUsed,
-          },
-        },
+      await this.audit.record('score_changed', {
+        matchId: m.id,
+        from: { status: m.status, homeScore: m.homeScore, awayScore: m.awayScore },
+        to: { status: snap.status, homeScore: snap.homeScore, awayScore: snap.awayScore },
+        provider: result.providerUsed,
       });
       anyChanged = true;
     }
